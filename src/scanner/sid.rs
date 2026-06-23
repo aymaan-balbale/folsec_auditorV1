@@ -3,6 +3,13 @@
 //! This module wraps `LookupAccountSidW` with careful buffer management and
 //! explicit handling of the "orphaned SID" case (ERROR_NONE_MAPPED).
 //!
+//! **Well-Known SID Protection**: Before flagging any SID as orphaned, we check
+//! it against a hardcoded whitelist of universal Windows SIDs (e.g., S-1-5-18
+//! Local System, S-1-1-0 Everyone). These SIDs are baked into every Windows
+//! installation and CANNOT be orphaned, but `LookupAccountSidW` can fail to
+//! resolve them on stripped-down Server Core installs, non-domain-joined VMs,
+//! and cross-forest trust boundary edge cases.
+//!
 //! Key Win32 nuance: `LookupAccountSidW` requires TWO calls:
 //!   1. Pass NULL buffers to get required buffer sizes.
 //!   2. Allocate those sizes and call again to get the actual strings.
@@ -19,6 +26,57 @@ use windows::{
 };
 
 use crate::errors::{AuditorError, Result};
+
+// ── Well-Known SID Whitelist ─────────────────────────────────────────────────
+//
+// These SIDs exist on EVERY Windows installation. They are NOT orphaned even
+// if `LookupAccountSidW` returns ERROR_NONE_MAPPED (which can happen on
+// Server Core, non-domain-joined machines, or across trust boundaries).
+//
+// Format: (SID string, domain label, account label)
+const WELL_KNOWN_SIDS: &[(&str, &str, &str)] = &[
+    ("S-1-5-18",     "NT AUTHORITY",  "SYSTEM"),
+    ("S-1-5-32-544", "BUILTIN",       "Administrators"),
+    ("S-1-5-11",     "NT AUTHORITY",  "Authenticated Users"),
+    ("S-1-5-32-545", "BUILTIN",       "Users"),
+    ("S-1-1-0",      "",              "Everyone"),
+    // Additional well-known SIDs that should never be flagged as orphaned:
+    ("S-1-5-32-546", "BUILTIN",       "Guests"),
+    ("S-1-5-19",     "NT AUTHORITY",  "LOCAL SERVICE"),
+    ("S-1-5-20",     "NT AUTHORITY",  "NETWORK SERVICE"),
+    ("S-1-5-32-547", "BUILTIN",       "Power Users"),
+    ("S-1-5-32-551", "BUILTIN",       "Backup Operators"),
+    ("S-1-3-0",      "",              "CREATOR OWNER"),
+    ("S-1-3-1",      "",              "CREATOR GROUP"),
+];
+
+/// Check whether a SID string matches a well-known Windows SID.
+///
+/// If the SID is well-known, returns `Some(ResolvedSid::Account { .. })`
+/// with the canonical name. Otherwise returns `None`.
+pub fn try_resolve_well_known(sid_string: &str) -> Option<ResolvedSid> {
+    for &(sid, domain, account) in WELL_KNOWN_SIDS {
+        if sid_string == sid {
+            let display = if domain.is_empty() {
+                account.to_string()
+            } else {
+                format!("{}\\{}", domain, account)
+            };
+            return Some(ResolvedSid::Account {
+                account_name: account.to_string(),
+                domain_name: domain.to_string(),
+                display,
+            });
+        }
+    }
+    None
+}
+
+/// Returns `true` if the given SID string is a well-known Windows SID that
+/// should never be flagged as orphaned.
+pub fn is_well_known_sid(sid_string: &str) -> bool {
+    WELL_KNOWN_SIDS.iter().any(|&(sid, _, _)| sid == sid_string)
+}
 
 /// The resolved identity of a SID.
 #[derive(Debug, Clone)]
@@ -91,11 +149,16 @@ pub fn resolve_sid(psid: PSID) -> Result<ResolvedSid> {
         let win32_err = WIN32_ERROR(e.code().0 as u32);
 
         // ERROR_NONE_MAPPED: SID exists but has no associated account.
-        // This IS the orphaned SID case — convert to raw string and return.
+        // Before flagging as orphaned, check the well-known SID whitelist.
+        // Universal Windows SIDs (Local System, Everyone, etc.) can fail
+        // dynamic lookup on Server Core / non-domain machines but are NOT
+        // orphaned.
         if win32_err == ERROR_NONE_MAPPED {
-            return Ok(ResolvedSid::Orphaned {
-                raw_sid: sid_to_string(psid),
-            });
+            let raw = sid_to_string(psid);
+            if let Some(resolved) = try_resolve_well_known(&raw) {
+                return Ok(resolved);
+            }
+            return Ok(ResolvedSid::Orphaned { raw_sid: raw });
         }
 
         // Any error other than INSUFFICIENT_BUFFER here is unexpected.
@@ -130,9 +193,11 @@ pub fn resolve_sid(psid: PSID) -> Result<ResolvedSid> {
     if let Err(e) = result {
         let win32_err = WIN32_ERROR(e.code().0 as u32);
         if win32_err == ERROR_NONE_MAPPED {
-            return Ok(ResolvedSid::Orphaned {
-                raw_sid: sid_to_string(psid),
-            });
+            let raw = sid_to_string(psid);
+            if let Some(resolved) = try_resolve_well_known(&raw) {
+                return Ok(resolved);
+            }
+            return Ok(ResolvedSid::Orphaned { raw_sid: raw });
         }
         return Err(AuditorError::SidResolution {
             sid_string: sid_to_string(psid),

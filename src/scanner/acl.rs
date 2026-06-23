@@ -41,7 +41,7 @@ use crate::{
     errors::{AuditorError, Result},
     scanner::{
         risk::{RiskFinding, RiskKind},
-        sid::{resolve_sid, ResolvedSid},
+        sid::{resolve_sid, is_well_known_sid, ResolvedSid},
     },
 };
 
@@ -245,10 +245,13 @@ pub fn extract_dacl_findings(path: &str) -> Result<Vec<RiskFinding>> {
                 let ace = unsafe { &*(ace_ptr as *const ACCESS_DENIED_ACE) };
                 let psid = PSID(&ace.SidStart as *const u32 as *mut _);
                 // Deny ACEs are generally GOOD (defense-in-depth).
-                // We still check for orphaned SIDs in deny ACEs.
+                // We still check for orphaned SIDs in deny ACEs, but protect
+                // well-known SIDs from false positive flagging.
                 match resolve_sid(psid) {
                     Ok(ResolvedSid::Orphaned { raw_sid }) => {
-                        findings.push(RiskFinding::orphaned_sid(path.to_string(), raw_sid));
+                        if !is_well_known_sid(&raw_sid) {
+                            findings.push(RiskFinding::orphaned_sid(path.to_string(), raw_sid));
+                        }
                     }
                     _ => {} // Deny ACE with valid SID = fine, skip
                 }
@@ -275,10 +278,16 @@ fn analyze_ace(
         Ok(r) => r,
         Err(_) => {
             // Resolution failure where we didn't even get an orphaned SID result.
-            // Treat as orphaned rather than silently skipping.
+            // Before flagging as orphaned, check the well-known SID whitelist
+            // to avoid false positives on universal Windows SIDs.
+            let raw = crate::scanner::sid::sid_to_string(psid);
+            if is_well_known_sid(&raw) {
+                // Well-known SID — skip silently, this is NOT orphaned.
+                return;
+            }
             findings.push(RiskFinding::orphaned_sid(
                 path.to_string(),
-                crate::scanner::sid::sid_to_string(psid),
+                raw,
             ));
             return;
         }
