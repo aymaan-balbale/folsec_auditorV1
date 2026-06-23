@@ -1,0 +1,5 @@
+﻿/target/
+**/*.rs.bk
+Cargo.lock
+*.exe
+.tmp_folsec_audit/

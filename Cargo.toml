@@ -1,0 +1,85 @@
+[package]
+name = "folsec-auditor"
+version = "0.1.0"
+edition = "2021"
+authors = ["FolSec Security Research <security@folsec.com>"]
+description = "NTFS/ACL Risk Auditor - Point-in-time gap analysis for enterprise file servers"
+license = "MIT"
+
+# Produce a single, statically linked executable suitable for
+# deployment on air-gapped enterprise servers without a Rust toolchain.
+# Build with: cargo build --release --target x86_64-pc-windows-msvc
+[profile.release]
+opt-level = 3
+lto = true          # Link-Time Optimization: reduces binary size ~30%
+codegen-units = 1   # Single codegen unit for maximum optimization
+strip = true        # Strip debug symbols from the final binary
+panic = "abort"     # Smaller binary; no stack unwinding on enterprise servers
+
+[dependencies]
+
+# ── Directory Traversal ─────────────────────────────────────────────────────
+# walkdir handles symlinks, permission errors, and deep nesting gracefully.
+# It yields DirEntry items lazily, so we never load the entire tree into RAM.
+walkdir = "2.5"
+
+# ── Parallelism ─────────────────────────────────────────────────────────────
+# rayon provides a work-stealing thread pool. We use par_bridge() to turn
+# walkdir's sequential iterator into a parallel one. On a 16-core server,
+# this alone delivers 8-12× throughput vs. single-threaded scanning.
+rayon = "1.10"
+
+# ── CLI Parsing ─────────────────────────────────────────────────────────────
+# clap with the `derive` feature gives us a clean, typed CLI struct with
+# automatic --help generation. Enterprise admins appreciate --help.
+clap = { version = "4.5", features = ["derive", "color", "wrap_help"] }
+
+# ── Serialization ───────────────────────────────────────────────────────────
+# serde + serde_json let us serialize our internal audit structures to JSON,
+# which is then embedded inside the self-contained HTML report.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# ── Error Handling ──────────────────────────────────────────────────────────
+# thiserror generates boilerplate-free, idiomatic error types. We NEVER
+# panic on enterprise servers — every error is a typed, reportable value.
+thiserror = "1.0"
+
+# ── Date/Time (for report timestamps) ───────────────────────────────────────
+chrono = { version = "0.4", features = ["serde"] }
+
+# ── Progress Display ─────────────────────────────────────────────────────────
+# indicatif gives a live spinner/progress bar during long scans so admins
+# know the process is alive on shares with 500k+ files.
+indicatif = "0.17"
+
+# ── Thread-Safe Shared State ─────────────────────────────────────────────────
+# dashmap is a concurrent HashMap used to accumulate findings across threads.
+dashmap = "6.0"
+
+# ── Win32 API Bindings ──────────────────────────────────────────────────────
+# The `windows` crate provides safe, generated bindings to the entire Win32
+# surface. We enable ONLY the feature flags we actually need to keep compile
+# times and binary size reasonable. Adding unused features costs real seconds.
+#
+# IMPORTANT: This [dependencies.windows] subsection MUST come LAST in the
+# [dependencies] block. In TOML, a dotted-key subsection like
+# [dependencies.windows] captures all subsequent key-value pairs until the
+# next [section] header. If any deps appear after this, Cargo will interpret
+# them as keys of the `windows` dependency (features), not as separate crates.
+[dependencies.windows]
+version = "0.58"
+features = [
+    # Core security / ACL APIs
+    "Win32_Security",                        # SECURITY_DESCRIPTOR, ACL, ACE structures
+    "Win32_Security_Authorization",          # GetNamedSecurityInfoW, SetNamedSecurityInfoW
+    "Win32_System_Memory",                   # LocalFree (required to free security descriptors)
+
+    # SID resolution
+    "Win32_Foundation",                      # BOOL, HANDLE, WIN32_ERROR, etc.
+    "Win32_NetworkManagement_NetManagement", # LookupAccountSidW
+
+    # File system interaction needed for anomaly simulator
+    "Win32_Storage_FileSystem",              # CreateDirectoryW, SetFileAttributesW
+    "Win32_System_SystemServices",           # FILE_ATTRIBUTE_HIDDEN
+]
