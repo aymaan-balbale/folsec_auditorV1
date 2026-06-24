@@ -265,6 +265,12 @@ pub fn extract_dacl_findings(path: &str) -> Result<Vec<RiskFinding>> {
 }
 
 /// Analyze a single Allow ACE for risk and append findings as needed.
+///
+/// **Critical fix (v1.1)**: Well-known SIDs like S-1-1-0 (Everyone) and
+/// S-1-5-11 (Authenticated Users) are now ALWAYS checked for over-permissive
+/// access masks, regardless of whether `LookupAccountSidW` succeeds or fails.
+/// Previously, a SID resolution error for a well-known SID caused an early
+/// return that bypassed the over-permissive ACE check entirely.
 #[cfg(target_os = "windows")]
 fn analyze_ace(
     path: &str,
@@ -273,23 +279,29 @@ fn analyze_ace(
     _is_deny: bool,
     findings: &mut Vec<RiskFinding>,
 ) {
+    use crate::scanner::sid::try_resolve_well_known;
+
     // Resolve the SID to a human-readable name.
     let resolved = match resolve_sid(psid) {
         Ok(r) => r,
         Err(_) => {
-            // Resolution failure where we didn't even get an orphaned SID result.
-            // Before flagging as orphaned, check the well-known SID whitelist
-            // to avoid false positives on universal Windows SIDs.
+            // Resolution failure — but the SID might be a well-known universal
+            // SID (Everyone, SYSTEM, etc.) that failed dynamic lookup on this
+            // machine. Fall back to the static whitelist BEFORE giving up.
             let raw = crate::scanner::sid::sid_to_string(psid);
-            if is_well_known_sid(&raw) {
-                // Well-known SID — skip silently, this is NOT orphaned.
+            if let Some(well_known) = try_resolve_well_known(&raw) {
+                // Successfully identified via whitelist — DO NOT return early.
+                // Fall through so the over-permissive check below can evaluate
+                // whether this well-known SID has dangerous permissions.
+                well_known
+            } else {
+                // Genuinely unresolvable SID → orphaned finding.
+                findings.push(RiskFinding::orphaned_sid(
+                    path.to_string(),
+                    raw,
+                ));
                 return;
             }
-            findings.push(RiskFinding::orphaned_sid(
-                path.to_string(),
-                raw,
-            ));
-            return;
         }
     };
 
@@ -303,6 +315,8 @@ fn analyze_ace(
     let trustee_lower = trustee.to_lowercase();
 
     // ── Over-permissive trustee check ─────────────────────────────────────
+    // This now runs for ALL resolved SIDs including well-known ones that were
+    // resolved via the static whitelist fallback above.
     let is_overpermissive_trustee = OVERPERMISSIVE_TRUSTEES
         .iter()
         .any(|&known| trustee_lower.contains(known));

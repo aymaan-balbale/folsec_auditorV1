@@ -3,8 +3,63 @@
 //! These structs are the canonical data model for all ACL findings.
 //! They derive `Serialize` so they flow directly into the HTML report's
 //! embedded JSON data island without any transformation layer.
+//!
+//! ## Context-Aware Severity (v1.2)
+//!
+//! Severity is now a function of BOTH the trustee and the file path:
+//!   - **Sensitive paths** (HR, Finance, Legal, Top_Secret, Confidential, Admin)
+//!     escalate severity by one or two levels.
+//!   - **Public paths** (Public, Drop, Common, Temp) de-escalate since broad
+//!     access is often intentional on shared drop folders.
+//!   - **General paths** use the baseline severity matrix.
 
 use serde::Serialize;
+
+// ── Path Context Classification ─────────────────────────────────────────────
+
+/// Substrings that indicate a path contains sensitive organizational data.
+/// Case-insensitive matching is applied against the full path string.
+const SENSITIVE_KEYWORDS: &[&str] = &[
+    "HR", "Finance", "Legal", "Top_Secret", "Confidential", "Admin",
+];
+
+/// Substrings that indicate a path is intentionally public / shared.
+/// Case-insensitive matching is applied against the full path string.
+const PUBLIC_KEYWORDS: &[&str] = &[
+    "Public", "Drop", "Common", "Temp",
+];
+
+/// The contextual classification of a filesystem path, used to modulate
+/// severity scores for the same ACL finding across different folder types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathContext {
+    /// Path contains sensitive organizational data keywords.
+    Sensitive,
+    /// Path is intentionally public / shared.
+    Public,
+    /// Path does not match any known classification.
+    General,
+}
+
+/// Classify a path string into a `PathContext` based on keyword matching.
+///
+/// Uses case-insensitive substring matching against the full path.
+/// Sensitive classification takes priority if both match (defense-in-depth).
+pub fn classify_path(path: &str) -> PathContext {
+    let path_lower = path.to_lowercase();
+
+    // Sensitive takes priority — if someone names a folder "Public_HR_Drop",
+    // we want to treat it as sensitive, not public.
+    if SENSITIVE_KEYWORDS.iter().any(|kw| path_lower.contains(&kw.to_lowercase())) {
+        return PathContext::Sensitive;
+    }
+
+    if PUBLIC_KEYWORDS.iter().any(|kw| path_lower.contains(&kw.to_lowercase())) {
+        return PathContext::Public;
+    }
+
+    PathContext::General
+}
 
 /// Severity levels used for triage and colour-coding in the HTML report.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -82,22 +137,70 @@ pub struct RiskFinding {
 
 impl RiskFinding {
     /// Convenience constructor for over-permissive ACE findings.
+    ///
+    /// **Severity escalation rules (v1.2 — context-aware)**:
+    ///
+    /// | Trustee                          | Sensitive Path | General Path | Public Path |
+    /// |----------------------------------|----------------|--------------|-------------|
+    /// | Everyone + FullControl/Modify     | CRITICAL       | HIGH         | MEDIUM      |
+    /// | Auth Users / BUILTIN\Users + FC/M | HIGH           | MEDIUM       | MEDIUM      |
+    /// | Other broad trustees              | MEDIUM         | MEDIUM       | LOW         |
     pub fn over_permissive(
         path: String,
         trustee: String,
         access_mask: u32,
         access_mask_human: String,
     ) -> Self {
-        let severity = if trustee.to_lowercase().contains("everyone") {
-            Severity::High
+        let trustee_lower = trustee.to_lowercase();
+        let is_full_control_or_modify =
+            access_mask & 0x001F01FF == 0x001F01FF  // Full Control
+            || access_mask & 0x000301BF == 0x000301BF; // Modify (approximation)
+        let is_everyone = trustee_lower.contains("everyone");
+        let is_auth_users = trustee_lower.contains("authenticated users");
+        let is_builtin_users = trustee_lower.contains("users");
+
+        let ctx = classify_path(&path);
+
+        let severity = if is_everyone && is_full_control_or_modify {
+            // "Everyone" with FullControl/Modify — escalation depends on path.
+            match ctx {
+                PathContext::Sensitive => Severity::Critical,
+                PathContext::General   => Severity::High,
+                PathContext::Public    => Severity::Medium,
+            }
+        } else if (is_auth_users || is_builtin_users) && is_full_control_or_modify {
+            // "Authenticated Users" or "BUILTIN\Users" with FullControl/Modify.
+            match ctx {
+                PathContext::Sensitive => Severity::High,
+                PathContext::General   => Severity::Medium,
+                PathContext::Public    => Severity::Medium,
+            }
+        } else if is_everyone {
+            // Everyone with lesser write permissions — still escalate on sensitive.
+            match ctx {
+                PathContext::Sensitive => Severity::High,
+                PathContext::General   => Severity::High,
+                PathContext::Public    => Severity::Medium,
+            }
         } else {
-            Severity::Medium
+            // Other broad trustees (Anonymous Logon, Creator Owner, etc.)
+            match ctx {
+                PathContext::Sensitive => Severity::Medium,
+                PathContext::General   => Severity::Medium,
+                PathContext::Public    => Severity::Low,
+            }
+        };
+
+        let ctx_label = match ctx {
+            PathContext::Sensitive => " [SENSITIVE PATH]",
+            PathContext::Public    => " [PUBLIC PATH]",
+            PathContext::General   => "",
         };
 
         let description = format!(
-            "Trustee '{}' has over-permissive access ({}). \
+            "Trustee '{}' has over-permissive access ({}).{} \
              This creates a wide blast radius for ransomware or insider threats.",
-            trustee, access_mask_human
+            trustee, access_mask_human, ctx_label
         );
 
         let remediation_hint = format!(
@@ -139,18 +242,36 @@ impl RiskFinding {
     }
 
     /// Convenience constructor for orphaned SID findings.
+    ///
+    /// **Context-aware severity (v1.2)**:
+    ///   - Orphaned SIDs on sensitive paths = HIGH (stale permissions on
+    ///     regulated data are a compliance violation waiting to happen).
+    ///   - Orphaned SIDs elsewhere = LOW (hygiene issue, not an urgent risk).
     pub fn orphaned_sid(path: String, raw_sid: String) -> Self {
+        let ctx = classify_path(&path);
+
+        let severity = match ctx {
+            PathContext::Sensitive => Severity::High,
+            PathContext::General | PathContext::Public => Severity::Low,
+        };
+
+        let ctx_label = match ctx {
+            PathContext::Sensitive => " This is a SENSITIVE path — stale permissions \
+                 here are a compliance risk (GDPR/KVKK/SOX).",
+            _ => "",
+        };
+
         Self {
             path: path.clone(),
-            severity: Severity::Low,
+            severity,
             risk: RiskKind::OrphanedSid {
                 raw_sid: raw_sid.clone(),
             },
             description: format!(
                 "ACE on '{}' references SID '{}' which could not be resolved to \
                  an active AD account. This is typically a deleted user or group \
-                 whose permissions were never cleaned up.",
-                path, raw_sid
+                 whose permissions were never cleaned up.{}",
+                path, raw_sid, ctx_label
             ),
             remediation_hint: format!(
                 "Remove ACE for unresolvable SID '{}'. Run 'Get-ADObject -Filter \
